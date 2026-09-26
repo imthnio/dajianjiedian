@@ -321,10 +321,6 @@ class LegacyMigrationTest(unittest.TestCase):
             )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class XrayListenTest(unittest.TestCase):
     def test_xray_inbounds_bind_listen_by_ipver(self):
         """Pure IPv6 installs must not leave Xray on default 0.0.0.0-only (false success)."""
@@ -337,3 +333,175 @@ class XrayListenTest(unittest.TestCase):
             idx = source.find(f'"protocol": "{proto}"')
             window = source[max(0, idx - 120):idx]
             self.assertIn('"listen": "$XRAY_LISTEN"', window, msg=proto)
+
+
+class IPv6ValidationTest(unittest.TestCase):
+    def function(self):
+        source = INSTALLER.read_text()
+        match = re.search(r"(_valid_ip\(\) \{.*?\n\})\n\n# gh_api_dl", source, re.S)
+        self.assertIsNotNone(match)
+        return match.group(1)
+
+    def accepts(self, value, version="6"):
+        result = subprocess.run(
+            ["sh", "-c", self.function() + f"\n_valid_ip {version} \"$1\"", "sh", value],
+        )
+        return result.returncode == 0
+
+    def test_rejects_text_and_short_groups_and_accepts_real_addresses(self):
+        self.assertTrue(self.accepts("2001:db8::1"))
+        self.assertTrue(self.accepts("[2001:db8::1]"))
+        self.assertTrue(self.accepts("2001:0db8:0000:0000:0000:0000:0000:0001"))
+        self.assertFalse(self.accepts("error: no address"))
+        self.assertFalse(self.accepts("dead:beef"))
+        self.assertFalse(self.accepts("2001:db8::1::2"))
+        self.assertFalse(self.accepts(":::"))
+        self.assertTrue(self.accepts("203.0.113.10", "4"))
+        self.assertFalse(self.accepts("203.0.113.256", "4"))
+
+
+class FstabSwapTest(unittest.TestCase):
+    def append_function(self):
+        source = INSTALLER.read_text()
+        match = re.search(r"(_fstab_append_swap\(\) \{.*?\n\})\n\n# 64MB", source, re.S)
+        self.assertIsNotNone(match)
+        return match.group(1)
+
+    def test_missing_newline_does_not_glue_root_line(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fstab = Path(temp) / "fstab"
+            fstab.write_bytes(b"/dev/vda1 / ext4 defaults 0 1")
+            env = os.environ.copy()
+            env["XRAY_FSTAB"] = str(fstab)
+            subprocess.run(
+                ["sh", "-c", self.append_function() + "\n_fstab_append_swap"],
+                env=env,
+                check=True,
+            )
+            lines = fstab.read_text().splitlines()
+            self.assertEqual(lines[0], "/dev/vda1 / ext4 defaults 0 1")
+            self.assertEqual(lines[1], "/xray-node.swap none swap sw 0 0")
+
+    def test_glued_line_is_split(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fstab = Path(temp) / "fstab"
+            fstab.write_text("/dev/vda1 / ext4 defaults 0 1/xray-node.swap none swap sw 0 0\n")
+            env = os.environ.copy()
+            env["XRAY_FSTAB"] = str(fstab)
+            subprocess.run(
+                ["sh", "-c", self.append_function() + "\n_fstab_append_swap"],
+                env=env,
+                check=True,
+            )
+            self.assertEqual(
+                fstab.read_text().splitlines(),
+                [
+                    "/dev/vda1 / ext4 defaults 0 1",
+                    "/xray-node.swap none swap sw 0 0",
+                ],
+            )
+
+
+class PartialNodeTest(unittest.TestCase):
+    def functions(self):
+        source = INSTALLER.read_text()
+        start = source.index("_drop_partial_node() {")
+        end = source.index("\n_abort_partial_node() {")
+        return source[start:end]
+
+    def test_reap_removes_unfinished_node_and_stops_its_unit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            nodes = root / "nodes"
+            bad = nodes / "3"
+            good = nodes / "2"
+            bad.mkdir(parents=True)
+            good.mkdir()
+            (bad / "core").write_text("hysteria\n")
+            (bad / "config.yaml").write_text("listen: 1\n")
+            (good / "node.txt").write_text("keep\n")
+            (good / "core").write_text("xray\n")
+            sd = root / "systemd"
+            sd.mkdir()
+            log = root / "svc.log"
+            env = os.environ.copy()
+            env.update({
+                "XRAY_NODES_DIR": str(nodes),
+                "XRAY_SYSTEMD_RUN": str(sd),
+                "SVC_LOG": str(log),
+            })
+            stubs = (
+                'warn() { :; }; '
+                'systemctl() { printf "%s\\n" "$*" >> "$SVC_LOG"; }; '
+                'pkill() { printf "%s\\n" "$*" >> "$SVC_LOG"; return 0; }; '
+            )
+            subprocess.run(
+                ["sh", "-c", stubs + self.functions() + "\n_reap_partial_nodes"],
+                env=env,
+                check=True,
+            )
+            self.assertFalse(bad.exists())
+            self.assertTrue((good / "node.txt").exists())
+            logged = log.read_text().splitlines()
+            self.assertIn("stop hysteria-node@3", logged)
+            self.assertIn("disable hysteria-node@3", logged)
+            self.assertTrue(any("config.yaml" in line for line in logged))
+            self.assertFalse(any("nodes/2" in line or line.endswith("@2") for line in logged))
+
+
+class DeleteNodeSelectionTest(unittest.TestCase):
+    def test_menu_deletes_the_real_node_id(self):
+        source = INSTALLER.read_text()
+        start = source.index("cat > /usr/local/bin/shanjiedian <<'XZEOF'\n")
+        start += len("cat > /usr/local/bin/shanjiedian <<'XZEOF'\n")
+        script = source[start:source.index("\nXZEOF\n", start)]
+        script = script.replace(
+            '_del_node() {\n  _d_id="$1"\n',
+            '_del_node() {\n  _d_id="$1"\n'
+            '  printf "%s\\n" "$_d_id" >> "$DELETE_LOG"\n'
+            '  return 0\n',
+            1,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            nodes = root / "nodes"
+            for node_id in ("2", "5"):
+                directory = nodes / node_id
+                directory.mkdir(parents=True)
+                (directory / "node.txt").write_text("协议: vless\n端口: 12345\n")
+            script = script.replace(
+                "NODES_DIR=/etc/xray-node/nodes",
+                f"NODES_DIR={nodes}",
+                1,
+            )
+            log = root / "deleted"
+            env = os.environ.copy()
+            env["DELETE_LOG"] = str(log)
+            result = subprocess.run(
+                ["sh", "-c", script],
+                input="2\n",
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertIn("节点 2", result.stdout)
+            self.assertIn("节点 5", result.stdout)
+            self.assertEqual(log.read_text().splitlines(), ["2"])
+            self.assertTrue((nodes / "5" / "node.txt").exists())
+
+            log.write_text("")
+            missed = subprocess.run(
+                ["sh", "-c", script],
+                input="1\n",
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertIn("没有这个节点编号", missed.stdout)
+            self.assertEqual(log.read_text(), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

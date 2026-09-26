@@ -122,7 +122,57 @@ get_ip() { # get_ip 4|6 -> 打印公网 IP，失败返回非零
 
 _valid_ip() { # _valid_ip 4|6 <串>：长得像对应版本的 IP 才返回 0
   if [ "$1" = "6" ]; then
-    case "$2" in *:*) return 0 ;; *) return 1 ;; esac
+    _v6="$2"
+    case "$_v6" in
+      \[*\]) _v6=${_v6#\[}; _v6=${_v6%\]} ;;
+    esac
+    # 检测网站失败时可能返回带冒号的网页文字。只要有冒号就当成 IPv6 的话，
+    # 节点链接是一串垃圾，安装却显示成功。
+    case "$_v6" in
+      *[!0-9A-Fa-f:]*) return 1 ;;
+      *[0-9A-Fa-f]*) ;;
+      *) return 1 ;;
+    esac
+    case "$_v6" in
+      *:*) ;;
+      *) return 1 ;;
+    esac
+    case "$_v6" in *:::*) return 1 ;; esac
+    _v6_once=${_v6#*::}
+    case "$_v6" in
+      *::*) case "$_v6_once" in *::*) return 1 ;; esac ;;
+    esac
+    # 每一段 1-4 位十六进制。有 :: 时显式段最多 7 段；没有 :: 时必须正好 8 段。
+    _v6_ok_side() {
+      _vs="$1"
+      _vs_n=0
+      [ -n "$_vs" ] || return 0
+      _vs_rest=$_vs
+      while [ -n "$_vs_rest" ]; do
+        _vs_g=${_vs_rest%%:*}
+        case "$_vs_g" in ''|*[!0-9A-Fa-f]*) return 1 ;; esac
+        [ "${#_vs_g}" -le 4 ] || return 1
+        _vs_n=$((_vs_n + 1))
+        case "$_vs_rest" in
+          *:*) _vs_rest=${_vs_rest#*:} ;;
+          *) _vs_rest="" ;;
+        esac
+      done
+      return 0
+    }
+    case "$_v6" in
+      *::*)
+        _v6_ok_side "${_v6%%::*}" || return 1
+        _v6_left_n=$_vs_n
+        _v6_ok_side "${_v6#*::}" || return 1
+        _v6_total=$((_v6_left_n + _vs_n))
+        [ "$_v6_total" -ge 1 ] && [ "$_v6_total" -le 7 ]
+        ;;
+      *)
+        _v6_ok_side "$_v6" || return 1
+        [ "$_vs_n" -eq 8 ]
+        ;;
+    esac
   else
     case "$2" in *:*|''|*[!0-9.]*|.*|*.) return 1 ;; esac
     [ "$(printf "%s" "$2" | tr -cd '.' | wc -c)" -eq 3 ] || return 1
@@ -466,9 +516,23 @@ _uninstall_all() {
   if [ -f /xray-node.swap ]; then
     swapoff /xray-node.swap >/dev/null 2>&1
     rm -f /xray-node.swap
-    if [ -f /etc/fstab ]; then
-      grep -v '/xray-node.swap' /etc/fstab > /etc/fstab.xray-node.tmp 2>/dev/null || true
-      mv -f /etc/fstab.xray-node.tmp /etc/fstab
+    # 粘在别的行末尾时只拆掉 swap 这一段，不能整行删掉（那一行可能是根分区）
+    _fs_file=${XRAY_FSTAB:-/etc/fstab}
+    if [ -f "$_fs_file" ] && [ -w "$_fs_file" ]; then
+      _fs_tmp=$(mktemp 2>/dev/null) || _fs_tmp=""
+      if [ -n "$_fs_tmp" ] && awk '
+        BEGIN { key = "/xray-node.swap none swap sw 0 0" }
+        {
+          i = index($0, key)
+          if (i == 0) { print; next }
+          if (i == 1) next
+          pre = substr($0, 1, i - 1)
+          if (pre != "") print pre
+        }
+      ' "$_fs_file" > "$_fs_tmp"; then
+        cat "$_fs_tmp" > "$_fs_file"
+      fi
+      rm -f "$_fs_tmp"
     fi
   fi
   [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1
@@ -493,12 +557,16 @@ _uninstall_all() {
 
 echo "==================== 节点管理 ===================="
 _n_count=0
+_n_ids=""
 for _d in "$NODES_DIR"/*/; do
   [ -f "${_d}node.txt" ] || continue
-  _n_count=$((_n_count + 1))
   _n_id=$(basename "$_d")
-  printf "  %s) 节点 %s：%s\n" "$_n_count" "$_n_id" "$(_node_info "$_n_id")"
-  eval "_nid_$_n_count='$_n_id'"
+  # 编号会跳号（删过的不重用）。必须按节点编号删，不能按菜单序号删，
+  # 否则列表里第 2 项可能是节点 5，输入 2 会把还在用的节点删掉。
+  case "$_n_id" in ''|*[!0-9]*) continue ;; esac
+  _n_count=$((_n_count + 1))
+  _n_ids="$_n_ids $_n_id"
+  printf "  节点 %s：%s\n" "$_n_id" "$(_node_info "$_n_id")"
 done
 if [ "$_n_count" = "0" ]; then
   echo "没有已安装的节点。"
@@ -506,7 +574,7 @@ if [ "$_n_count" = "0" ]; then
 fi
 printf "  0) 取消\n"
 printf "  all) 删除全部节点并卸载干净\n"
-printf "请选择要删除的节点编号: "
+printf "请输入要删除的节点编号（上面显示的数字）: "
 read -r _sel
 case "$_sel" in
   0|"") echo "已取消" ;;
@@ -518,11 +586,15 @@ case "$_sel" in
   *)
     case "$_sel" in ''|*[!0-9]*) echo "输入不对，已取消" ;;
       *)
-        if [ "$_sel" -ge 1 ] && [ "$_sel" -le "$_n_count" ]; then
-          eval "_del_node \"\$_nid_$_sel\""
-        else
-          echo "没有这个编号，已取消"
-        fi
+        _found=0
+        for _cand in $_n_ids; do
+          if [ "$_cand" = "$_sel" ]; then
+            _found=1
+            _del_node "$_sel"
+            break
+          fi
+        done
+        [ "$_found" = "1" ] || echo "没有这个节点编号，已取消"
         ;;
     esac
     ;;
@@ -599,14 +671,14 @@ export GOMEMLIMIT=${_hy_gomem}MiB"
   _si_svc="xray-node-${_si_id}"
   [ "$LOW_MEM" = "1" ] && drop_page_cache
   if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    # 模板 unit 只写一次，多个节点共用（%i 即节点 id）
-    if [ ! -f "$_si_tpl" ]; then
-      case "$_si_core" in
-        hysteria) _si_tpl_bin="$HY_BIN"; _si_tpl_args="server -c /etc/xray-node/nodes/%i/config.yaml"; _si_tpl_desc="Hysteria2 node %i" ;;
-        sing-box) _si_tpl_bin="$SB_BIN"; _si_tpl_args="run -c /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="sing-box node %i" ;;
-        *)        _si_tpl_bin="$XRAY_BIN"; _si_tpl_args="-config /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="Xray node %i" ;;
-      esac
-      cat > "$_si_tpl" <<EOF
+    # 每次都重写模板。只在文件不存在时写一次的话，旧模板没有小内存环境变量，
+    # 64MB 机器更新内核后新进程照旧被打爆，端口起不来。
+    case "$_si_core" in
+      hysteria) _si_tpl_bin="$HY_BIN"; _si_tpl_args="server -c /etc/xray-node/nodes/%i/config.yaml"; _si_tpl_desc="Hysteria2 node %i" ;;
+      sing-box) _si_tpl_bin="$SB_BIN"; _si_tpl_args="run -c /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="sing-box node %i" ;;
+      *)        _si_tpl_bin="$XRAY_BIN"; _si_tpl_args="-config /etc/xray-node/nodes/%i/config.json"; _si_tpl_desc="Xray node %i" ;;
+    esac
+    cat > "$_si_tpl" <<EOF
 [Unit]
 Description=${_si_tpl_desc}
 After=network.target
@@ -620,7 +692,6 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-    fi
     systemctl daemon-reload
     systemctl enable "$_si_unit" >/dev/null 2>&1
     systemctl restart "$_si_unit" >/dev/null 2>&1
@@ -679,36 +750,10 @@ RCEOF
   fi
 }
 
-_svc_restart() { # _svc_restart <节点id>：只重启该节点的服务（更新模式用）
-  _sr_id="$1"
-  _sr_core=$(tr -d ' \r\n' < /etc/xray-node/nodes/"$_sr_id"/core 2>/dev/null)
-  _sr_cfg=/etc/xray-node/nodes/"$_sr_id"/config.json
-  case "$_sr_core" in
-    hysteria)
-      _sr_unit="hysteria-node@${_sr_id}"
-      _sr_cfg=/etc/xray-node/nodes/"$_sr_id"/config.yaml
-      ;;
-    sing-box) _sr_unit="singbox-node@${_sr_id}" ;;
-    *)        _sr_unit="xray-node@${_sr_id}" ;;
-  esac
-  if [ "$_sr_core" = "hysteria" ]; then
-    _hy_export_env
-  fi
-  [ "$LOW_MEM" = "1" ] && drop_page_cache
-  if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-    systemctl restart "$_sr_unit" >/dev/null 2>&1
-  elif command -v rc-service >/dev/null 2>&1; then
-    rc-service "xray-node-${_sr_id}" restart >/dev/null 2>&1
-  else
-    pkill -f "$_sr_cfg" >/dev/null 2>&1
-    sleep 1
-    case "$_sr_core" in
-      hysteria) nohup "$HY_BIN" server -c "$_sr_cfg" >/var/log/xray-node-"$_sr_id".log 2>&1 & ;;
-      sing-box) nohup "$SB_BIN" run -c "$_sr_cfg" >/var/log/xray-node-"$_sr_id".log 2>&1 & ;;
-      *)        nohup "$XRAY_BIN" -config "$_sr_cfg" >/var/log/xray-node-"$_sr_id".log 2>&1 & ;;
-    esac
-  fi
-  sleep 1
+_svc_restart() { # _svc_restart <节点id>：重写服务模板后再重启（更新模式用）
+  # 走 _svc_install：它会重写 systemd/OpenRC 模板。只 systemctl restart 的话，
+  # 64MB 机器上的旧单元没有 GOMEMLIMIT，新内核一起就可能被打爆。
+  _svc_install "$1"
 }
 
 _node_port() { # _node_port <节点id> -> "端口 协议"（从该节点的 fw_info 第一行读）
@@ -789,6 +834,41 @@ recover_disk_space() {
   if [ "$LOW_MEM" = "1" ] || { [ -n "$_rdf" ] && [ "$_rdf" -lt 200 ]; }; then
     rm -f /var/cache/apt/archives/*.deb 2>/dev/null
   fi
+}
+
+# 往 fstab 追加 swap 行。文件最后如果没有换行，直接 >> 会把上一行粘死
+# （常见是根分区那一行），重启时根分区挂不上。
+_fstab_append_swap() {
+  _fs_file=${XRAY_FSTAB:-/etc/fstab}
+  if [ ! -f "$_fs_file" ]; then
+    _fs_dir=$(dirname "$_fs_file")
+    [ -w "$_fs_dir" ] || return 0
+    touch "$_fs_file" 2>/dev/null || return 0
+  fi
+  [ -w "$_fs_file" ] || return 0
+  _fs_key='/xray-node.swap none swap sw 0 0'
+  if grep -q '/xray-node\.swap' "$_fs_file" 2>/dev/null; then
+    grep -q '^/xray-node\.swap[[:space:]]' "$_fs_file" 2>/dev/null && return 0
+    _fs_tmp=$(mktemp 2>/dev/null) || return 0
+    if awk -v key="$_fs_key" '
+      {
+        i = index($0, key)
+        if (i == 0) { print; next }
+        if (i == 1) { print; next }
+        pre = substr($0, 1, i - 1)
+        if (pre != "") print pre
+        print key
+      }
+    ' "$_fs_file" > "$_fs_tmp"; then
+      cat "$_fs_tmp" > "$_fs_file"
+    fi
+    rm -f "$_fs_tmp"
+    return 0
+  fi
+  if [ -s "$_fs_file" ] && [ -n "$(tail -c 1 "$_fs_file" 2>/dev/null)" ]; then
+    printf '\n' >> "$_fs_file"
+  fi
+  printf '%s\n' "$_fs_key" >> "$_fs_file"
 }
 
 # 64MB / 128MB 的 NAT：Go 程序启动时会多申请一段内存，默认策略直接拒绝；
@@ -883,12 +963,7 @@ prepare_low_memory() {
   chmod 600 "$_swapf" 2>/dev/null
   if mkswap "$_swapf" >/dev/null 2>&1 && swapon "$_swapf" >/dev/null 2>&1; then
     SWAP_OK=1
-    if [ -f /etc/fstab ] || [ -w /etc ]; then
-      touch /etc/fstab 2>/dev/null
-      if ! grep -q '/xray-node.swap' /etc/fstab 2>/dev/null; then
-        printf '/xray-node.swap none swap sw 0 0\n' >> /etc/fstab 2>/dev/null
-      fi
-    fi
+    _fstab_append_swap
     info "虚拟内存已开启（${_sw}MB），重启后也会自动挂上"
   else
     rm -f "$_swapf"
@@ -1188,6 +1263,60 @@ esac
 
 # 64MB NAT 要在装任何大程序之前做完：放开内存申请，并尽量加一块虚拟内存
 prepare_low_memory
+
+# 上次安装如果在写出 node.txt 之前失败，目录和服务会留下，但 shanjiedian 看不到。
+# 服务开着 Restart=on-failure 就会一直占端口；64MB 机器上还会把后来的更新拖进回滚。
+_drop_partial_node() {
+  _dp_id="$1"
+  _dp_dir="$2"
+  [ -n "$_dp_id" ] && [ -n "$_dp_dir" ] && [ -d "$_dp_dir" ] || return 0
+  [ -f "$_dp_dir/node.txt" ] && return 0
+  case "$_dp_id" in ''|*[!0-9]*) return 0 ;; esac
+  _dp_core=$(tr -d ' \r\n' < "$_dp_dir/core" 2>/dev/null)
+  _dp_sd=${XRAY_SYSTEMD_RUN:-/run/systemd/system}
+  if command -v systemctl >/dev/null 2>&1 && [ -d "$_dp_sd" ]; then
+    case "$_dp_core" in
+      sing-box) _dp_units="singbox-node@${_dp_id}" ;;
+      hysteria) _dp_units="hysteria-node@${_dp_id}" ;;
+      xray) _dp_units="xray-node@${_dp_id}" ;;
+      *) _dp_units="xray-node@${_dp_id} singbox-node@${_dp_id} hysteria-node@${_dp_id}" ;;
+    esac
+    for _dp_unit in $_dp_units; do
+      systemctl stop "$_dp_unit" >/dev/null 2>&1
+      systemctl disable "$_dp_unit" >/dev/null 2>&1
+      systemctl reset-failed "$_dp_unit" >/dev/null 2>&1
+    done
+  fi
+  if command -v rc-service >/dev/null 2>&1; then
+    rc-service "xray-node-${_dp_id}" stop >/dev/null 2>&1
+    rc-update del "xray-node-${_dp_id}" default >/dev/null 2>&1
+    rm -f "/etc/init.d/xray-node-${_dp_id}"
+  fi
+  pkill -f "${_dp_dir%/}/config.json" >/dev/null 2>&1
+  pkill -f "${_dp_dir%/}/config.yaml" >/dev/null 2>&1
+  rm -rf "$_dp_dir"
+}
+
+_reap_partial_nodes() {
+  _nodes_root=${XRAY_NODES_DIR:-/etc/xray-node/nodes}
+  for _rp in "$_nodes_root"/*/; do
+    [ -d "$_rp" ] || continue
+    [ -f "${_rp}node.txt" ] && continue
+    _reap_id=$(basename "$_rp")
+    _drop_partial_node "$_reap_id" "$_rp"
+    [ -d "$_rp" ] || warn "已清掉上次没装完的节点 ${_reap_id}"
+  done
+  rmdir "$_nodes_root" 2>/dev/null || true
+}
+
+_abort_partial_node() {
+  [ -n "${NODE_DIR:-}" ] && [ -n "${NODE_ID:-}" ] || return 0
+  [ -d "$NODE_DIR" ] && [ ! -f "$NODE_DIR/node.txt" ] || return 0
+  _drop_partial_node "$NODE_ID" "$NODE_DIR"
+  rmdir "${XRAY_NODES_DIR:-/etc/xray-node/nodes}" 2>/dev/null || true
+}
+
+_reap_partial_nodes
 
 # ---------- 2c. 老版本迁移：单节点布局 -> 多节点布局 ----------
 # 老版本只有一个节点（/etc/xray-node/node.txt + xray/sing-box 单服务）。
@@ -1601,6 +1730,10 @@ if ! SERVER_IP=$(get_ip "$IPVER"); then
   [ -z "$SERVER_IP" ] && die "没有 IP 装不了，先去查一下你的服务器 IP 再来"
 fi
 info "服务器 IP：$SERVER_IP"
+# 用户经常把 IPv6 连方括号一起粘贴。这里先剥掉，下面再加一层，避免链成 [[地址]]。
+case "$SERVER_IP" in
+  \[*\]) SERVER_IP=${SERVER_IP#\[}; SERVER_IP=${SERVER_IP%\]} ;;
+esac
 # 按实际地址格式决定链接里是否加方括号（IPv6 必须加 []）
 case "$SERVER_IP" in
   *:*) LINK_IP="[$SERVER_IP]" ;;
@@ -1807,6 +1940,9 @@ if [ "$NEED_REALITY" -eq 1 ]; then
 fi
 
 # 前面的输入和下载都成功后才创建新节点目录。
+# node.txt 写成功后才算装完。中途失败要停掉刚拉起的服务并删掉这个目录，
+# 否则重启循环占着端口，而且管理命令看不到它。
+trap _abort_partial_node EXIT
 mkdir -p "$NODE_DIR" || die "无法创建节点目录 $NODE_DIR"
 
 # ---------- 9b. 自签证书（Hysteria2 / TUIC 需要） ----------
@@ -2252,6 +2388,7 @@ esac
   printf "以后想看节点，直接输入: jiedian\n"
   printf "==============================================\n"
 } > "$NODE_DIR/node.txt"
+trap - EXIT
 
 write_helper_cmds
 info "已安装 jiedian 命令：以后输入 jiedian 就能看所有节点"
